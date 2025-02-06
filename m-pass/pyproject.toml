@@ -7,4 +7,5 @@ requires-python = ">=3.9"
 dependencies = [
     "matplotlib>=3.9.4",
     "pandas>=2.2.3",
+    "ruff>=0.9.4",
 ]
