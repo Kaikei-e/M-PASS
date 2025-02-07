@@ -7,13 +7,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
-// parse the XML file
+// HealthData は XML ファイルのルート要素を表す構造体
 type HealthData struct {
+	XMLName xml.Name `xml:"HealthData"` // ルート要素のタグ名を指定
 	Records []Record `xml:"Record"`
 }
+
+// Record は XML ファイル内の Record 要素を表す構造体
 type Record struct {
 	Type          string `xml:"type,attr"`
 	Value         string `xml:"value,attr"`
@@ -24,20 +26,24 @@ type Record struct {
 	CreationDate  string `xml:"creationDate,attr,omitempty"`
 	StartDate     string `xml:"startDate,attr,omitempty"`
 	EndDate       string `xml:"endDate,attr,omitempty"`
+	// MetadataEntry や InstantaneousBeatsPerMinute などの子要素も必要に応じて追加
+	MetadataEntries []MetadataEntry `xml:"MetadataEntry,omitempty"`
+}
+
+type MetadataEntry struct {
+	Key   string `xml:"key,attr"`
+	Value string `xml:"value,attr"`
 }
 
 func main() {
-	// wait args
-	if len(os.Args) < 2 {
-		fmt.Println("Please provide the path to the XML file.")
+	if len(os.Args) < 3 { // 引数は2つ必要 (XMLファイルパスと出力ディレクトリ)
+		fmt.Println("Usage: go run main.go <xml_file_path> <output_directory>")
 		os.Exit(1)
 	}
 
-	// first arg is the path to the XML file, second arg is the path to the output directory
 	xmlPath := os.Args[1]
 	outputDir := os.Args[2]
 
-	// read the XML file
 	xmlFile, err := os.Open(xmlPath)
 	if err != nil {
 		fmt.Println("Error opening XML file:", err)
@@ -45,102 +51,95 @@ func main() {
 	}
 	defer xmlFile.Close()
 
-	fmt.Println("Reading XML file:", xmlPath)
-
-	// read the XML file
 	xmlData, err := io.ReadAll(xmlFile)
 	if err != nil {
 		fmt.Println("Error reading XML file:", err)
 		os.Exit(1)
 	}
 
-	fmt.Println("XML file read successfully")
-
 	var healthData HealthData
-	d := xml.NewDecoder(strings.NewReader(string(xmlData)))
-	d.Strict = false
-	err = d.Decode(&healthData)
+	// XMLをHealthData構造体にデコード
+	decoder := xml.NewDecoder(bytes.NewReader(xmlData))
+	decoder.Strict = false // 厳密なXML構文チェックを無効にする
+	decoder.CharsetReader = func(charset string, input io.Reader) (io.Reader, error) {
+		return input, nil // 文字コード変換は行わない
+	}
+
+	err = decoder.Decode(&healthData)
 	if err != nil {
-		fmt.Println("Error parsing XML file:", err)
+		fmt.Println("Error decoding XML:", err) // XMLデコード時のエラー
 		os.Exit(1)
 	}
 
-	fmt.Println("XML file parsed successfully")
-
-	// Group the records by type attribute
+	// type 属性ごとに Record をグループ化
 	recordsByType := make(map[string][]Record)
 	for _, record := range healthData.Records {
 		recordsByType[record.Type] = append(recordsByType[record.Type], record)
 	}
 
-	fmt.Println("Records grouped by type successfully")
+	// 出力ディレクトリを作成 (存在しない場合)
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		fmt.Println("Error creating output directory:", err)
+		os.Exit(1)
+	}
 
-	// create the output directory
-	os.MkdirAll(outputDir, 0755)
+	// type ごとにファイルを作成・追記
+	for typeAttr, records := range recordsByType {
+		// ファイルパスを作成
+		filePath := filepath.Join(outputDir, typeAttr+".xml")
 
-	fmt.Println("Output directory created successfully")
+		// ファイルが存在するか確認
+		_, err := os.Stat(filePath)
+		fileExists := !os.IsNotExist(err)
 
-	// create the output files (append if file exists, else create new)
-	for typeAttr, recs := range recordsByType {
-		filePath := filepath.Join(outputDir, fmt.Sprintf("%s.xml", typeAttr))
-		if _, err := os.Stat(filePath); os.IsNotExist(err) {
-			// File does not exist: create new file with root element.
-			file, err := os.Create(filePath)
+		var file *os.File
+		if fileExists {
+			// 既存ファイルの場合は追記モードで開く
+			file, err = os.OpenFile(filePath, os.O_RDWR, 0644)
 			if err != nil {
-				fmt.Println("Error creating output file:", err)
+				fmt.Println("Error opening existing file:", err)
 				os.Exit(1)
 			}
-			// Write XML header and opening root tag.
+
+			// </HealthData> タグを削除するためにファイルサイズを調整
+			fileInfo, _ := file.Stat()
+			fileSize := fileInfo.Size()
+			if fileSize > int64(len("</HealthData>")) {
+				file.Truncate(fileSize - int64(len("</HealthData>")))
+				file.Seek(-int64(len("</HealthData>")), io.SeekEnd) //SeekEndからマイナス方向に移動
+			}
+
+		} else {
+			// 新規ファイルの場合は作成
+			file, err = os.Create(filePath)
+			if err != nil {
+				fmt.Println("Error creating file:", err)
+				os.Exit(1)
+			}
+			// XML ヘッダーとルート要素の開始タグを書き込み
 			file.WriteString(`<?xml version="1.0" encoding="utf-8"?>` + "\n")
 			file.WriteString("<HealthData>\n")
-			// Write only the values.
-			for _, rec := range recs {
-				file.WriteString(fmt.Sprintf("<%s><SourceName>%s</SourceName><SourceVersion>%s</SourceVersion><Device>%s</Device><Unit>%s</Unit><CreationDate>%s</CreationDate><StartDate>%s</StartDate><EndDate>%s</EndDate><Value>%s</Value></%s>\n", typeAttr, rec.SourceName, rec.SourceVersion, rec.Device, rec.Unit, rec.CreationDate, rec.StartDate, rec.EndDate, rec.Value, typeAttr))
-			}
-			// Write closing root tag.
-			file.WriteString("</HealthData>\n")
-			file.Close()
-			fmt.Println("New output file created and records written:", filePath)
-		} else {
-			// File exists: open file in read-write mode so we can append new records.
-			file, err := os.OpenFile(filePath, os.O_RDWR, 0644)
-			if err != nil {
-				fmt.Println("Error opening existing output file:", err)
-				os.Exit(1)
-			}
-			// Read the file content.
-			content, err := io.ReadAll(file)
-			if err != nil {
-				fmt.Println("Error reading existing output file:", err)
-				os.Exit(1)
-			}
-			closingTag := []byte("</HealthData>\n")
-			idx := bytes.LastIndex(content, closingTag)
-			if idx == -1 {
-				fmt.Println("Error: closing tag not found in file:", filePath)
-				os.Exit(1)
-			}
-			// Truncate the file to remove the closing tag.
-			err = file.Truncate(int64(idx))
-			if err != nil {
-				fmt.Println("Error truncating file:", err)
-				os.Exit(1)
-			}
-			// Seek to the new end.
-			_, err = file.Seek(0, io.SeekEnd)
-			if err != nil {
-				fmt.Println("Error seeking to file end:", err)
-				os.Exit(1)
-			}
-			// Append only the values.
-			for _, rec := range recs {
-				file.WriteString(fmt.Sprintf("<SourceName>%s</SourceName><SourceVersion>%s</SourceVersion><Device>%s</Device><Unit>%s</Unit><CreationDate>%s</CreationDate><StartDate>%s</StartDate><EndDate>%s</EndDate><Value>%s</Value>\n", rec.SourceName, rec.SourceVersion, rec.Device, rec.Unit, rec.CreationDate, rec.StartDate, rec.EndDate, rec.Value))
-			}
-			// Append the closing tag again.
-			file.Write(closingTag)
-			file.Close()
-			fmt.Println("Appended records to existing file successfully:", filePath)
 		}
+
+		// Record を XML 形式で書き込み
+		for _, record := range records {
+			recordXML, err := xml.MarshalIndent(record, "  ", "    ") // インデント付きでエンコード
+			if err != nil {
+				fmt.Println("Error marshalling record to XML:", err)
+				continue // エラーが発生した場合はスキップ
+			}
+			_, err = file.Write(append(recordXML, '\n')) // XML を書き込み (改行を追加)
+			if err != nil {
+				fmt.Println("Error writing record to file:", err)
+				file.Close() // エラーが発生した場合はファイルを閉じる
+				os.Exit(1)
+			}
+		}
+
+		// ルート要素の終了タグを書き込み、ファイルを閉じる
+		file.WriteString("</HealthData>\n")
+		file.Close()
+		fmt.Printf("Processed records of type '%s' and saved to '%s'\n", typeAttr, filePath)
 	}
 
 	fmt.Println("Done!")
