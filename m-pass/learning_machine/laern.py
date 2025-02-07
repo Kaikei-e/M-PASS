@@ -7,17 +7,13 @@
 ここでは、学習のみを行う
 """
 
-from dataset_maker import DatasetMaker
+from learning_machine.dataset_maker import DatasetMaker
 import pandas as pd
 
 
 def learn(target_dir: str):
     dataset_maker = DatasetMaker(target_dir)
-    if dataset_maker.dataset is None:
-        raise ValueError("dataset is None")
-    else:
-        test_data, train_data = dataset_maker.make_dataset()
-
+    test_data, train_data = dataset_maker.make_dataset()
     # 学習データを用いてモデルを作成する。
     model = train_data.model_selection.train_test_split(test_size=0.2)
     print("Learning is done")
