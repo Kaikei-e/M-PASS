@@ -2,12 +2,13 @@
 import os
 import xml.etree.ElementTree as ET
 
+
 def parse_and_split_xml(input_file, output_dir, output_prefix, split_func):
     """
     入力XMLファイルをパースし、Record要素をtype属性でグループ化して、
     各グループごとに出力ファイルを作成（既存の場合は追記）する。
     出力ファイルは以下の形式となる。
-    
+
     <?xml version="1.0" encoding="utf-8"?>
     <HealthData>
        <{type}>
@@ -31,16 +32,16 @@ def parse_and_split_xml(input_file, output_dir, output_prefix, split_func):
     with open(input_file, "r", encoding="utf-8") as f:
         xml_data = f.read()
     print("XML file read successfully")
-    
+
     # XMLをパース（Strictモードは False とする）
     try:
         root = ET.fromstring(xml_data)
     except ET.ParseError as e:
         print("Error parsing XML file:", e)
         exit(1)
-    
+
     print("XML file parsed successfully")
-    
+
     # <Record> 要素のみ抽出し、type属性でグループ化
     records_by_type = {}
     for rec in root.findall("Record"):
@@ -52,25 +53,25 @@ def parse_and_split_xml(input_file, output_dir, output_prefix, split_func):
         if should_split:
             key = new_filename if new_filename else type_attr
             records_by_type.setdefault(key, []).append(rec)
-    
+
     print("Records grouped by type successfully")
-    
+
     # 各グループごとに出力ファイルを作成または追記
     for type_attr, recs in records_by_type.items():
         # 出力ファイル名は「{output_dir}/{type_attr}.xml」とする
         file_path = os.path.join(output_dir, f"{type_attr}.xml")
-        
+
         # レコードを出力するフォーマットを作成するヘルパー関数
         def build_record_str(rec, tag):
             # main.go の書式に合わせて、各属性をタグとして出力
-            src_name    = rec.get("sourceName", "")
+            src_name = rec.get("sourceName", "")
             src_version = rec.get("sourceVersion", "")
-            device      = rec.get("device", "")
-            unit        = rec.get("unit", "")
-            creation    = rec.get("creationDate", "")
-            start_date  = rec.get("startDate", "")
-            end_date    = rec.get("endDate", "")
-            value       = rec.get("value", "")
+            device = rec.get("device", "")
+            unit = rec.get("unit", "")
+            creation = rec.get("creationDate", "")
+            start_date = rec.get("startDate", "")
+            end_date = rec.get("endDate", "")
+            value = rec.get("value", "")
             return (
                 f"<{tag}>"
                 f"<SourceName>{src_name}</SourceName>"
@@ -83,7 +84,7 @@ def parse_and_split_xml(input_file, output_dir, output_prefix, split_func):
                 f"<Value>{value}</Value>"
                 f"</{tag}>\n"
             )
-        
+
         if not os.path.exists(file_path):
             # ファイルが存在しない場合は、新規作成
             with open(file_path, "w", encoding="utf-8") as f:
@@ -116,8 +117,9 @@ def parse_and_split_xml(input_file, output_dir, output_prefix, split_func):
                 f.write(closing_tag)
                 f.truncate()
             print("Appended records to existing file successfully:", file_path)
-    
+
     print("Done!")
+
 
 def split_by_record_element(rec):
     """
@@ -126,4 +128,3 @@ def split_by_record_element(rec):
     """
     t = rec.get("type", "")
     return (True, t)
-
