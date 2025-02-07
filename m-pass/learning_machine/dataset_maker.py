@@ -26,7 +26,9 @@ class DatasetMaker:
         # 複数のXMLファイルをtarget_dirから読み込む。
         for file in os.listdir(self.target_dir):
             if file.endswith(".xml"):
-                with open(os.path.join(self.target_dir, file), "r", encoding="utf-8") as f:
+                with open(
+                    os.path.join(self.target_dir, file), "r", encoding="utf-8"
+                ) as f:
                     data = f.read()
                     list_of_data.append(data)
 

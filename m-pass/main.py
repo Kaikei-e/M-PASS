@@ -1,6 +1,7 @@
 import argparse
 from learning_machine.laern import learn
 
+
 def main():
     parser = argparse.ArgumentParser(description="Process XML files.")
     parser.add_argument("target_dir", type=str, help="Path to the target directory")

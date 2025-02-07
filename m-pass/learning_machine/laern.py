@@ -21,7 +21,7 @@ def learn(target_dir: str):
     # 学習データを用いてモデルを作成する。
     model = train_data.model_selection.train_test_split(test_size=0.2)
     print("Learning is done")
-    
+
     # モデルを保存する。
     model.save("model.h5")
     print("Model is saved")
