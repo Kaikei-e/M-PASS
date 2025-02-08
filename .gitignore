@@ -11,3 +11,11 @@ wheels/
 
 
 .DS_Store
+*.xml
+*.csv
+*.json
+*.xlsx
+*.xls
+*.pdf
+*.txt
+*.docx
