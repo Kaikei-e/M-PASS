@@ -2,249 +2,214 @@ from learning_machine.dataset_maker import DatasetMaker
 import os
 import pandas as pd
 import numpy as np
-import tensorflow as tf  # TensorFlow をインポート  ※TensorFlow がインストールされている必要あり
+import tensorflow as tf
 from sklearn.metrics import mean_squared_error
+from tqdm import tqdm  # 進捗表示用
+
+# タスク用の関数をグローバルレベルに移動
+def process_chunk(input_data: pd.DataFrame, output_data: pd.Series, sequence_length: int, start: int, chunk_size: int, n_samples: int):
+    """
+    指定されたインデックスからchunk_size分のシーケンスを作成する関数。
+
+    Parameters:
+        input_data (pd.DataFrame): 特徴量のDataFrame。
+        output_data (pd.Series): 目的変数のSeries。
+        sequence_length (int): シーケンスの長さ。
+        start (int): チャンク開始インデックス。
+        chunk_size (int): チャンクサイズ。
+        n_samples (int): 全体のシーケンス数。
+
+    Returns:
+        Tuple (X_chunk, y_chunk): 部分シーケンスと対応するターゲットのリスト。
+    """
+    X_chunk = []
+    y_chunk = []
+    end = min(start + chunk_size, n_samples)
+    for i in range(start, end):
+        X_sample = input_data[i: i + sequence_length].values
+        y_sample = output_data.iloc[i + sequence_length]
+        X_chunk.append(X_sample)
+        y_sample = np.array([y_sample])
+        y_chunk.append(y_sample)
+    return X_chunk, y_chunk
 
 
+def create_sequences(input_data, output_data, sequence_length):
+    """
+    指定されたシーケンス長に基づいて時系列の入力シーケンスとターゲットを作成する関数。
+    ベクトル化処理に加えて、各工程の処理時間や進捗をログ出力することでボトルネックを可視化する。
 
-def learn(
-    target_dir,
-):
+    Parameters:
+        input_data (pd.DataFrame): 特徴量のデータフレーム。
+        output_data (pd.Series): 対応するターゲット値のシリーズ。
+        sequence_length (int): シーケンスの長さ。
+
+    Returns:
+        X (np.ndarray): シーケンス格納用配列。shape=(n_samples, sequence_length, n_features)
+        y (np.ndarray): ターゲット値配列。shape=(n_samples,)
+    """
+    import time
+
+    # --- ステップ1: NumPy 配列に変換 ---
+    t0 = time.time()
+    input_array = (
+        input_data.to_numpy() if hasattr(input_data, "to_numpy") else np.asarray(input_data)
+    )
+    output_array = (
+        output_data.to_numpy() if hasattr(output_data, "to_numpy") else np.asarray(output_data)
+    )
+    t1 = time.time()
+    print(f"[DEBUG] Conversion to NumPy arrays took {t1 - t0:.3f} seconds.")
+
+    N = input_array.shape[0]
+    if N <= sequence_length:
+        raise ValueError("データ数がシーケンス長より少ないため、シーケンス作成ができません。")
+
+    # --- ステップ2: sliding_window_view によるシーケンス窓の取得 ---
+    t2 = time.time()
+    X_windows = np.lib.stride_tricks.sliding_window_view(input_array, window_shape=sequence_length, axis=0)
+    t3 = time.time()
+    print(f"[DEBUG] Sliding window view creation took {t3 - t2:.3f} seconds.")
+
+    # sliding_window_view の結果は view なので、全体のコピーが遅延する可能性がある
+    # X_windows の shape は (N - sequence_length + 1, sequence_length, n_features) となる
+    n_total = X_windows.shape[0] - 1
+    print(f"[DEBUG] Total sequences to copy: {n_total}")
+
+    # --- ステップ3: チャンクごとにコピー (コピー負荷の可視化のため進捗バー付き) ---
+    chunk_size = 100000  # このサイズはメモリ状況に応じて調整可能
+    n_chunks = (n_total + chunk_size - 1) // chunk_size
+    X_chunks = []
+    t4 = time.time()
+    for i in tqdm(range(n_chunks), desc="Copying sequence chunks"):
+        start_idx = i * chunk_size
+        end_idx = min((i + 1) * chunk_size, n_total)
+        # 各チャンクごとにビューからコピー
+        X_chunks.append(X_windows[start_idx: end_idx].copy())
+    X = np.concatenate(X_chunks, axis=0)
+    t5 = time.time()
+    print(f"[DEBUG] Copying {n_chunks} chunks took {t5 - t4:.3f} seconds.")
+
+    # --- ステップ4: ターゲット値の抽出 ---
+    t6 = time.time()
+    y = output_array[sequence_length:]
+    t7 = time.time()
+    print(f"[DEBUG] Extracting target values took {t7 - t6:.3f} seconds.")
+
+    total_time = t7 - t0
+    print(f"[DEBUG] Total create_sequences time: {total_time:.3f} seconds.")
+    return X, y
+
+
+def create_sequences_generator(input_data, output_data, sequence_length, batch_size):
+    """
+    バッチごとに連続したシーケンスを生成するジェネレータ関数です。
+    
+    ・入力データ、出力データは事前にNumPy配列に変換し、
+      np.lib.stride_tricks.sliding_window_view により view を取得。
+    ・バッチごとに np.ascontiguousarray を用いて連続メモリブロックに変換することで、
+      下流のTensorFlow処理を高速化します。
+    """
+    input_array = input_data.to_numpy() if hasattr(input_data, "to_numpy") else np.asarray(input_data)
+    print(f"[DEBUG] Input array shape: {input_array.shape}")
+    output_array = output_data.to_numpy() if hasattr(output_data, "to_numpy") else np.asarray(output_data)
+    print(f"[DEBUG] Output array shape: {output_array.shape}")
+    
+    total_sequences = input_array.shape[0] - sequence_length
+    print(f"[DEBUG] Total sequences available: {total_sequences}")
+    
+    # sliding_window_view はデータの view を返す（コピーは発生しない）
+    X_view = np.lib.stride_tricks.sliding_window_view(input_array, window_shape=sequence_length, axis=0)
+    
+    for start in tqdm(range(0, total_sequences, batch_size), desc="Generating sequence batches"):
+        end = min(start + batch_size, total_sequences)
+        X_batch = np.ascontiguousarray(X_view[start:end])
+        y_batch = output_array[start + sequence_length : end + sequence_length]
+        yield X_batch, y_batch
+
+
+def learn(target_dir):
+    """
+    モデル学習のフロー：
+      1. DatasetMaker でXMLファイルからデータをストリーミング処理し、DataFrameを作成
+      2. 前処理（One-Hot Encoding、時系列設定、補完処理など）
+      3. create_sequences_generator により、バッチ単位でシーケンス生成
+      4. LSTM モデルの定義・学習
+    """
     if not os.path.exists(target_dir):
         raise FileNotFoundError(f"Target directory not found: {target_dir}")
 
+    print("[INFO] Dataset creation started...")
     dataset_maker = DatasetMaker(target_dir)
+    test_data, train_data = dataset_maker.make_dataset()
 
-    print("Dataset creation started...")
-    test_data_original, train_data_original = (
-        dataset_maker.make_dataset()
-    )  # make_dataset() が分割されたデータセットを返すように変更
+    if train_data.empty:
+        raise ValueError("Train dataset is empty. XMLデータの内容を確認してください。")
+    if test_data.empty:
+        print("[WARNING] Test dataset is empty.")
 
-    if train_data_original.empty:  # 学習データセットが空の場合はエラーとする (変更なし)
-        raise ValueError(
-            "Train dataset is empty. Please check your XML data and DatasetMaker implementation."
-        )
-    if test_data_original.empty:  # テストデータセットが空の場合は警告とする (変更なし)
-        print(
-            "Warning: Test dataset is empty. Please check your XML data or consider reducing test_size in DatasetMaker."
-        )
+    print("[INFO] Dataset state after creation:")
+    print(f"  Train shape: {train_data.shape}")
+    print(f"  Test shape: {test_data.shape}")
 
-    print("\n[Debug] Datasetの状態 (dataset_maker.make_dataset() 直後):")
-    print("train_data_original.empty:", train_data_original.empty)
-    print("test_data_original.empty:", test_data_original.empty)
-    print("train_data_original.shape:", train_data_original.shape)
-    print("test_data_original.shape:", test_data_original.shape)
-    print("train_data_original.head():\n", train_data_original.head())
-    print(
-        "test_data_original.head():\n", test_data_original.head()
-    )  # テストデータセットの head() も出力 # 変更
-    print("--------------------------------------------------")
+    # カテゴリ変数のOne-Hot Encoding
+    categorical_columns = ["type", "unit"]
+    print(f"[INFO] One-Hot Encoding on columns: {categorical_columns}")
+    train_data_encoded = pd.get_dummies(train_data, columns=categorical_columns)
+    test_data_encoded = pd.get_dummies(test_data, columns=categorical_columns)
 
-    # ★★★  カテゴリデータ One-Hot Encoding (type, unit) ★★★ (変更)
-    print(
-        "\n[Debug] データ型確認 (One-Hot Encoding 前):"
-    )  # One-Hot Encoding 前のデータ型確認
-    print(train_data_original.dtypes)  # 学習データセットのデータ型を出力
-    print(test_data_original.dtypes)  # テストデータセットのデータ型を出力
-
-    # カテゴリデータ列を特定 (例: 'type', 'unit' 列,  必要に応じて列名を追加・修正)
-    categorical_columns = ["type", "unit"]  # 'unit' 列も追加！ # 変更
-
-    print(
-        "\n[Debug] One-Hot Encoding 対象列:", categorical_columns
-    )  # One-Hot Encoding 対象列をログ出力
-
-    # 学習データとテストデータで One-Hot Encoding を実行
-    train_data_encoded = pd.get_dummies(
-        train_data_original, columns=categorical_columns
-    )
-    test_data_encoded = pd.get_dummies(test_data_original, columns=categorical_columns)
-
-    print(
-        "\n[Debug] One-Hot Encoding 後のデータ形状:"
-    )  # One-Hot Encoding 後のデータ形状をログ出力
-    print(
-        "train_data_encoded.shape:", train_data_encoded.shape
-    )  # 学習データセットの shape を出力
-    print(
-        "test_data_encoded.shape:", test_data_encoded.shape
-    )  # テストデータセットの shape を出力
-
-    print(
-        "\n[Debug] One-Hot Encoding 後のデータ型:"
-    )  # One-Hot Encoding 後のデータ型を出力
-    print(train_data_encoded.dtypes)  # 学習データセットのデータ型を出力
-    print(test_data_encoded.dtypes)  # テストデータセットのデータ型を出力
-
-    print(
-        "\n[Debug] One-Hot Encoding 後の学習データ (train_data_encoded.head()):"
-    )  # One-Hot Encoding 後の学習データ head() を出力
-    print(train_data_encoded.head())
-    print(
-        "\n[Debug] One-Hot Encoding 後のテストデータ (test_data_encoded.head()):"
-    )  # One-Hot Encoding 後のテストデータ head() を出力
-    print("--------------------------------------------------")
-
-    # ★★★  LSTM モデル  ★★★
-    print("\n[Debug] LSTM モデル 学習・評価 開始")  # LSTM モデル 学習・評価 開始ログ
-
-    # 1. 時系列データとして整形 (endDate をインデックスに設定)
-    train_data_ts = train_data_encoded.set_index(
-        "endDate"
-    )  # 学習データで 'endDate' をインデックスに設定
-    test_data_ts = test_data_encoded.set_index(
-        "endDate"
-    )  # テストデータで 'endDate' をインデックスに設定
-
-    # インデックスを DatetimeIndex に変換 (もし 'endDate' 列が文字列型の場合)
+    # 時系列処理：endDate をインデックスに設定
+    train_data_ts = train_data_encoded.set_index("endDate")
+    test_data_ts = test_data_encoded.set_index("endDate")
     train_data_ts = train_data_ts.set_index(pd.to_datetime(train_data_ts.index))
     test_data_ts = test_data_ts.set_index(pd.to_datetime(test_data_ts.index))
 
-    # ★★★  value 列を数値型 (float64) に明示的に変換 (エラー回避応急処置) ★★★
-    target_column = "value"  # 予測対象列 (例: 'value' 列)
-    train_data_ts[target_column] = pd.to_numeric(
-        train_data_ts[target_column], errors="coerce"
-    )  # 数値に変換、エラーは NaN に
-    test_data_ts[target_column] = pd.to_numeric(
-        test_data_ts[target_column], errors="coerce"
-    )  # テストデータも同様に変換
+    # target カラムの補完（数値変換、欠損値補完）
+    target_column = "value"
+    train_data_ts[target_column] = pd.to_numeric(train_data_ts[target_column], errors="coerce")
+    test_data_ts[target_column] = pd.to_numeric(test_data_ts[target_column], errors="coerce")
+    train_data_ts = train_data_ts.infer_objects().interpolate(method="linear")
+    test_data_ts = test_data_ts.infer_objects().interpolate(method="linear")
 
-    print(
-        "\n[Debug] LSTM モデル入力データ型 (数値型変換後):"
-    )  # データ型確認ログ (数値型変換後)
-    print(
-        "train_data_ts[target_column].dtype:\n", train_data_ts[target_column].dtype
-    )  # データ型を出力
-    print(
-        "train_data_ts[target_column].head():\n",
-        train_data_ts[target_column].head(),
-    )  # データの中身 (先頭5行) を出力
-    print("--------------------------------------------------")
-    # ★★★  数値型変換処理 (ここまで) ★★★
+    # 特徴量は target カラム以外の全カラムを利用
+    feature_columns = [col for col in train_data_ts.columns if col != target_column]
+    sequence_length = 5
+    print(f"[INFO] Sequence generation with sequence_length = {sequence_length}")
+    print(f"[INFO] Number of feature columns: {len(feature_columns)}")
 
-    # 欠損値処理 (例: 線形補間) - 必要に応じて
-    train_data_ts = train_data_ts.interpolate(
-        method="linear"
-    )  # 学習データの欠損値を線形補間
-    test_data_ts = test_data_ts.interpolate(
-        method="linear"
-    )  # テストデータの欠損値を線形補間
-
-    print(
-        "\n[Debug] LSTM モデル入力データ型 (interpolate() 適用後):"
-    )  # データ型確認ログ (interpolate() 適用後)
-    print(
-        "train_data_ts[target_column].dtype:\n", train_data_ts[target_column].dtype
-    )  # データ型を出力
-    print(
-        "train_data_ts[target_column].head():\n",
-        train_data_ts[target_column].head(),
-    )  # データの中身 (先頭5行) を出力
-    print("--------------------------------------------------")
-    # ★★★ デバッグログ追加 (ここまで) ★★★
-
-    # 2. データシーケンス作成 (LSTM モデル入力用)  ★★★ (追加)
-    sequence_length = (
-        20  #  LSTM に入力する過去のデータ数 (シーケンス長) を定義 (例: 20)
-    )
-    target_column = "value"  # 予測対象列 (例: 'value' 列)
-    feature_columns = [
-        col for col in train_data_ts.columns if col != target_column
-    ]  # 特徴量として使用する列 (target_column 以外全て)
-
-    print(
-        "\n[Debug] LSTM モデル データシーケンス作成 (sequence_length):", sequence_length
-    )  # データシーケンス作成設定ログ
-    print("[Debug] LSTM モデル 特徴量列:", feature_columns)  # 特徴量列ログ
-
-    # 学習データとテストデータからシーケンスを作成
-    X_train, y_train = create_sequences(
-        train_data_ts[feature_columns].fillna(
-            train_data_ts[feature_columns].mean()
-        ),  # 特徴量列の欠損値を平均値で補完
-        train_data_ts[target_column].fillna(
-            train_data_ts[target_column].mean()
-        ),  # ターゲット列の欠損値を平均値で補完
+    # バッチ生成用のジェネレータ作成（メモリ効率向上のため下流に連続配列として供給）
+    batch_size = 100000  # 必要に応じて調整
+    train_gen = create_sequences_generator(
+        train_data_ts[feature_columns].fillna(train_data_ts[feature_columns].mean()),
+        train_data_ts[target_column].fillna(train_data_ts[target_column].mean()),
         sequence_length,
-    )
-    X_test, y_test = create_sequences(
-        test_data_ts[feature_columns].fillna(
-            test_data_ts[feature_columns].mean()
-        ),  # 特徴量列の欠損値を平均値で補完
-        test_data_ts[target_column].fillna(
-            test_data_ts[target_column].mean()
-        ),  # ターゲット列の欠損値を平均値で補完
-        sequence_length,
+        batch_size
     )
 
-    print("\n[Debug] LSTM モデル データシーケンス形状:")  # データシーケンス形状ログ
-    print("X_train.shape:", X_train.shape)  # 学習データ入力シーケンスの形状
-    print("y_train.shape:", y_train.shape)  # 学習データターゲットの形状
-    print("X_test.shape:", X_test.shape)  # テストデータ入力シーケンスの形状
-    print("y_test.shape:", y_test.shape)  # テストデータターゲットの形状
-    print("--------------------------------------------------")
+    total_sequences = len(train_data_ts) - sequence_length
+    steps_per_epoch = (total_sequences + batch_size - 1) // batch_size
+    print(f"[INFO] Steps per epoch: {steps_per_epoch}")
 
-    # 3. LSTM モデル構築  ★★★ (追加)
-    model = tf.keras.models.Sequential(
-        [
-            tf.keras.layers.LSTM(
-                units=50,
-                activation="relu",
-                input_shape=(X_train.shape[1], X_train.shape[2]),
-            ),  # LSTM層 (units は LSTM ユニット数, input_shape は入力シーケンスの形状)
-            tf.keras.layers.Dense(
-                units=1
-            ),  # 出力層 (units=1 は 1次元の値を予測するため)
-        ]
-    )
+    # LSTMモデルの定義（シンプルな構造の例）
+    model = tf.keras.models.Sequential([
+        tf.keras.layers.LSTM(
+            units=50,
+            activation="relu",
+            input_shape=(sequence_length, len(feature_columns))
+        ),
+        tf.keras.layers.Dense(units=1)
+    ])
+    model.compile(optimizer="adam", loss="mse")
+    model.summary()
 
-    # 4. モデルコンパイル  ★★★ (追加)
-    model.compile(
-        optimizer="adam", loss="mse"
-    )  # Optimizer は Adam, 損失関数は MSE を使用
-
-    print("\n[Debug] LSTM モデル モデル構造:")  # モデル構造ログ
-    model.summary()  # モデル構造を summary で出力
-
-    # 5. モデル学習  ★★★ (追加)
-    epochs = 10  # 学習エポック数 (調整可能)
-    batch_size = 32  # バッチサイズ (調整可能)
+    epochs = 10
     history = model.fit(
-        X_train,
-        y_train,
+        train_gen,
+        steps_per_epoch=steps_per_epoch,
         epochs=epochs,
-        batch_size=batch_size,
-        validation_data=(X_test, y_test),
-        verbose=0,
-    )  # モデル学習 (verbose=0 で学習ログ非表示)
+        verbose=1
+    )
 
-    print("\n[Debug] LSTM モデル 学習履歴:")  # 学習履歴ログ
-    print(history.history)  # 学習履歴 (損失関数の値など) を出力
+    print("[INFO] Model training complete.")
+    # ここで予測や評価も実施可能です。
 
-    # 6. 予測  ★★★ (追加)
-    predictions = model.predict(
-        X_test, verbose=0
-    )  # テストデータで予測 (verbose=0 で予測ログ非表示)
-
-    print(
-        "\n[Debug] LSTM モデル 予測結果 (predictions[:5]):"
-    )  # LSTM モデル 予測結果 (predictions[:5]) ログ
-    print(predictions[:5])  # 予測値の先頭5行を出力
-
-    # 7. 評価 (MSE)  ★★★ (変更)
-    mse = mean_squared_error(
-        y_test, predictions
-    )  # テストデータの実測値 (y_test) と予測値 (predictions) を MSE で評価 # 変更
-    print(f"\nMean Squared Error (LSTM): {mse}")  # MSE を出力 # 変更
-
-    print("\n[Debug] LSTM モデル 学習・評価 完了")  # LSTM モデル 学習・評価 完了ログ
-
-
-def create_sequences(
-    input_data, output_data, sequence_length
-):  # データシーケンスを作成する関数 (変更なし)
-    X, y = [], []
-    for i in range(len(input_data) - sequence_length):
-        X.append(input_data[i : i + sequence_length].values)
-        y.append(output_data.iloc[i + sequence_length])  # output_data は Series を想定
-    return np.array(X), np.array(y)
