@@ -1,5 +1,4 @@
-import argparse
-from learning_machine.laern import learn
+from learning_machine.learn import learn
 
 
 def main(target_dir: str):
