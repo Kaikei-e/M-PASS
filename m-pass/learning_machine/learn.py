@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 from learning_machine.dataset_maker import DatasetMaker
 import os
 import pandas as pd
@@ -5,9 +7,20 @@ import numpy as np
 import tensorflow as tf
 from sklearn.metrics import mean_squared_error
 from tqdm import tqdm  # 進捗表示用
+import json
+from sklearn.preprocessing import StandardScaler
+from tensorflow.keras import regularizers
+from tensorflow.keras import mixed_precision
 
 # タスク用の関数をグローバルレベルに移動
-def process_chunk(input_data: pd.DataFrame, output_data: pd.Series, sequence_length: int, start: int, chunk_size: int, n_samples: int):
+def process_chunk(
+    input_data: pd.DataFrame,
+    output_data: pd.Series,
+    sequence_length: int,
+    start: int,
+    chunk_size: int,
+    n_samples: int,
+):
     """
     指定されたインデックスからchunk_size分のシーケンスを作成する関数。
 
@@ -26,7 +39,7 @@ def process_chunk(input_data: pd.DataFrame, output_data: pd.Series, sequence_len
     y_chunk = []
     end = min(start + chunk_size, n_samples)
     for i in range(start, end):
-        X_sample = input_data[i: i + sequence_length].values
+        X_sample = input_data[i : i + sequence_length].values
         y_sample = output_data.iloc[i + sequence_length]
         X_chunk.append(X_sample)
         y_sample = np.array([y_sample])
@@ -36,106 +49,64 @@ def process_chunk(input_data: pd.DataFrame, output_data: pd.Series, sequence_len
 
 def create_sequences(input_data, output_data, sequence_length):
     """
-    指定されたシーケンス長に基づいて時系列の入力シーケンスとターゲットを作成する関数。
-    ベクトル化処理に加えて、各工程の処理時間や進捗をログ出力することでボトルネックを可視化する。
-
-    Parameters:
-        input_data (pd.DataFrame): 特徴量のデータフレーム。
-        output_data (pd.Series): 対応するターゲット値のシリーズ。
-        sequence_length (int): シーケンスの長さ。
-
-    Returns:
-        X (np.ndarray): シーケンス格納用配列。shape=(n_samples, sequence_length, n_features)
-        y (np.ndarray): ターゲット値配列。shape=(n_samples,)
+    sliding_window_view を使い、ビューのまま処理するバージョン（コピー不要の場合）
     """
-    import time
-
-    # --- ステップ1: NumPy 配列に変換 ---
-    t0 = time.time()
-    input_array = (
-        input_data.to_numpy() if hasattr(input_data, "to_numpy") else np.asarray(input_data)
-    )
-    output_array = (
-        output_data.to_numpy() if hasattr(output_data, "to_numpy") else np.asarray(output_data)
-    )
-    t1 = time.time()
-    print(f"[DEBUG] Conversion to NumPy arrays took {t1 - t0:.3f} seconds.")
+    input_array = input_data.to_numpy()
+    output_array = output_data.to_numpy()
 
     N = input_array.shape[0]
     if N <= sequence_length:
-        raise ValueError("データ数がシーケンス長より少ないため、シーケンス作成ができません。")
+        raise ValueError(
+            "データ数がシーケンス長より少ないため、シーケンス作成ができません。"
+        )
 
-    # --- ステップ2: sliding_window_view によるシーケンス窓の取得 ---
-    t2 = time.time()
-    X_windows = np.lib.stride_tricks.sliding_window_view(input_array, window_shape=sequence_length, axis=0)
-    t3 = time.time()
-    print(f"[DEBUG] Sliding window view creation took {t3 - t2:.3f} seconds.")
-
-    # sliding_window_view の結果は view なので、全体のコピーが遅延する可能性がある
-    # X_windows の shape は (N - sequence_length + 1, sequence_length, n_features) となる
-    n_total = X_windows.shape[0] - 1
-    print(f"[DEBUG] Total sequences to copy: {n_total}")
-
-    # --- ステップ3: チャンクごとにコピー (コピー負荷の可視化のため進捗バー付き) ---
-    chunk_size = 100000  # このサイズはメモリ状況に応じて調整可能
-    n_chunks = (n_total + chunk_size - 1) // chunk_size
-    X_chunks = []
-    t4 = time.time()
-    for i in tqdm(range(n_chunks), desc="Copying sequence chunks"):
-        start_idx = i * chunk_size
-        end_idx = min((i + 1) * chunk_size, n_total)
-        # 各チャンクごとにビューからコピー
-        X_chunks.append(X_windows[start_idx: end_idx].copy())
-    X = np.concatenate(X_chunks, axis=0)
-    t5 = time.time()
-    print(f"[DEBUG] Copying {n_chunks} chunks took {t5 - t4:.3f} seconds.")
-
-    # --- ステップ4: ターゲット値の抽出 ---
-    t6 = time.time()
+    X = np.lib.stride_tricks.sliding_window_view(
+        input_array, window_shape=sequence_length, axis=0
+    )[:-1]  # 最後の要素はターゲットがないので除外
     y = output_array[sequence_length:]
-    t7 = time.time()
-    print(f"[DEBUG] Extracting target values took {t7 - t6:.3f} seconds.")
 
-    total_time = t7 - t0
-    print(f"[DEBUG] Total create_sequences time: {total_time:.3f} seconds.")
     return X, y
-
 
 def create_sequences_generator(input_data, output_data, sequence_length, batch_size):
     """
-    バッチごとに連続したシーケンスを生成するジェネレータ関数です。
-    
-    ・入力データ、出力データは事前にNumPy配列に変換し、
-      np.lib.stride_tricks.sliding_window_view により view を取得。
-    ・バッチごとに np.ascontiguousarray を用いて連続メモリブロックに変換することで、
-      下流のTensorFlow処理を高速化します。
+    メモリ効率の良いシーケンス生成ジェネレータ (with ステートメントを使用)
     """
-    input_array = input_data.to_numpy() if hasattr(input_data, "to_numpy") else np.asarray(input_data)
-    print(f"[DEBUG] Input array shape: {input_array.shape}")
-    output_array = output_data.to_numpy() if hasattr(output_data, "to_numpy") else np.asarray(output_data)
-    print(f"[DEBUG] Output array shape: {output_array.shape}")
-    
-    total_sequences = input_array.shape[0] - sequence_length
-    print(f"[DEBUG] Total sequences available: {total_sequences}")
-    
-    # sliding_window_view はデータの view を返す（コピーは発生しない）
-    X_view = np.lib.stride_tricks.sliding_window_view(input_array, window_shape=sequence_length, axis=0)
-    
-    for start in tqdm(range(0, total_sequences, batch_size), desc="Generating sequence batches"):
-        end = min(start + batch_size, total_sequences)
-        X_batch = np.ascontiguousarray(X_view[start:end])
-        y_batch = output_array[start + sequence_length : end + sequence_length]
-        yield X_batch, y_batch
+    input_array = input_data.to_numpy()
+    output_array = output_data.to_numpy()
+    total_samples = len(input_array) - sequence_length
+    n_features = input_array.shape[1]
 
+    # マルチスレッドプールの作成
+    n_workers = min(os.cpu_count(), 16)
+
+    def process_batch(start_idx):
+        """バッチ処理用の内部関数"""
+        end_idx = min(start_idx + batch_size, total_samples)
+        X_batch = []
+        y_batch = []
+        for i in range(start_idx, end_idx):
+            X_batch.append(input_array[i:i + sequence_length])
+            y_batch.append(output_array[i + sequence_length])
+
+        X_batch = np.array(X_batch)
+        y_batch = np.array(y_batch)
+        return X_batch, y_batch
+
+    # バッチインデックスの生成
+    batch_starts = range(0, total_samples, batch_size)
+
+    with ThreadPoolExecutor(max_workers=n_workers) as executor:
+        for start_idx in tqdm(batch_starts, desc="Generating sequences"):
+            future = executor.submit(process_batch, start_idx)
+            X_batch, y_batch = future.result()
+            yield X_batch, y_batch
 
 def learn(target_dir):
     """
-    モデル学習のフロー：
-      1. DatasetMaker でXMLファイルからデータをストリーミング処理し、DataFrameを作成
-      2. 前処理（One-Hot Encoding、時系列設定、補完処理など）
-      3. create_sequences_generator により、バッチ単位でシーケンス生成
-      4. LSTM モデルの定義・学習
+    最適化されたモデル学習のフロー
     """
+    wd = os.getcwd()
+
     if not os.path.exists(target_dir):
         raise FileNotFoundError(f"Target directory not found: {target_dir}")
 
@@ -152,64 +123,230 @@ def learn(target_dir):
     print(f"  Train shape: {train_data.shape}")
     print(f"  Test shape: {test_data.shape}")
 
-    # カテゴリ変数のOne-Hot Encoding
+    # データの前処理
+    train_data_ts, test_data_ts, scaler = clean_data(train_data, test_data)
+    feature_columns = train_data_ts.columns
+    target_column = "value"
+    sequence_length = 5000
+
+    # バッチサイズの設定
+    batch_size = 128
+
+    # TensorFlowのメモリ使用量を制限しない
+    gpus = tf.config.experimental.list_physical_devices("GPU")
+    if gpus:
+        try:
+            for gpu in gpus:
+                print(f"[INFO] Setting memory growth for GPU: {gpu}")
+                tf.config.experimental.set_memory_growth(gpu, True)
+        except RuntimeError as e:
+            print(f"GPU memory growth setting failed: {e}")
+
+    # データセットをTensorFlow形式に変換し、プリフェッチを使用
+    train_gen = create_sequences_generator(
+        train_data_ts[feature_columns],
+        train_data_ts[target_column],
+        sequence_length,
+        batch_size,
+    )
+    if not os.path.exists(target_dir):
+        raise FileNotFoundError(f"Target directory not found: {target_dir}")
+
+    print("[INFO] Dataset creation started...")
+    dataset_maker = DatasetMaker(target_dir)
+    test_data, train_data = dataset_maker.make_dataset()
+
+    if train_data.empty or test_data.empty:  # 両方とも空でないかチェック
+        raise ValueError(
+            "Train or Test dataset is empty. XMLデータの内容を確認してください。"
+        )
+
+    print("[INFO] Dataset state after creation:")
+    print(f"  Train shape: {train_data.shape}")
+    print(f"  Test shape: {test_data.shape}")
+
+    # ジェネレータからデータセットを作成
+    train_dataset = tf.data.Dataset.from_generator(
+        lambda: train_gen,
+        output_signature=(
+            tf.TensorSpec(
+                shape=(None, sequence_length, len(feature_columns)), dtype=tf.float32
+            ),
+            tf.TensorSpec(shape=(None,), dtype=tf.float32),
+        ),
+    ).prefetch(tf.data.AUTOTUNE)
+
+    test_gen = create_sequences_generator(
+        test_data_ts[feature_columns],
+        test_data_ts[target_column],
+        sequence_length,
+        batch_size,
+    )
+
+    test_dataset = tf.data.Dataset.from_generator(
+        lambda: test_gen,
+        output_signature=(
+            tf.TensorSpec(
+                shape=(None, sequence_length, len(feature_columns)), dtype=tf.float32
+            ),
+            tf.TensorSpec(shape=(None,), dtype=tf.float32),
+        ),
+    ).prefetch(tf.data.AUTOTUNE)
+
+    # モデルの定義（より効率的な構成）
+    model = tf.keras.models.Sequential(
+        [
+            tf.keras.layers.LSTM(
+                units=32,
+                activation="relu",
+                input_shape=(sequence_length, len(feature_columns)),
+                return_sequences=False,
+                dropout=0.3,  # オーバーフィッティング防止
+                kernel_regularizer=regularizers.l2(0.01),
+
+            ),
+            tf.keras.layers.BatchNormalization(),  # 学習の安定化
+            tf.keras.layers.Dense(units=1),
+            tf.keras.layers.Dropout(0.3),
+        ]
+    )
+
+    policy = mixed_precision.Policy('mixed_float16')
+    mixed_precision.set_global_policy(policy)
+
+    # 最適化設定
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.0001)
+    optimizer = mixed_precision.LossScaleOptimizer(optimizer)
+    model.compile(
+        optimizer=optimizer,
+        loss=tf.keras.losses.MeanSquaredError(),
+        metrics=["mae"],  # 平均絶対誤差も追跡
+    )
+
+    # コールバックの設定
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=3, restore_best_weights=True
+        ),  # val_loss を監視
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=2
+        ),  # val_loss を監視
+    ]
+
+    # モデルの学習 (validation_data を指定)
+    history = model.fit(
+        train_dataset,
+        epochs=10,
+        validation_data=test_dataset,  # 検証データを渡す
+        callbacks=callbacks,
+        verbose=1,
+    )
+
+    wd = os.getcwd()
+
+    # モデルを保存
+    model_save_path = os.path.join(wd, "model_tester", "model.h5")
+    print(f"[INFO] Saving model to {model_save_path}")
+    model.save(model_save_path)
+
+    # 学習履歴も保存（オプション）
+    history_save_path = os.path.join(wd, "model_tester", "training_history.npy")
+    np.save(history_save_path, history.history)
+
+    print("[INFO] Model and history saved successfully")
+
+    return model, history
+
+
+
+def preprocess_features(data_ts: pd.DataFrame, scaler: Optional[StandardScaler] = None, target_column: str = "value") -> tuple[pd.DataFrame, np.ndarray, StandardScaler]:
+    """
+    特徴量の前処理を行う関数 (学習データとテストデータで共通化)
+    """
+    feature_columns = [col for col in data_ts.columns if col != target_column]
+    X_features = data_ts[feature_columns].copy()
+    y_values = pd.to_numeric(data_ts[target_column], errors='coerce')
+
+    for col in X_features.columns:
+        X_features[col] = pd.to_numeric(X_features[col], errors='coerce').fillna(0)
+
+    # 学習時のみ Scaler を作成・適用、テスト時は学習時の Scaler を使用
+    if scaler is None:
+        scaler = StandardScaler()
+        y_scaled = scaler.fit_transform(y_values.values.reshape(-1, 1)).flatten()  # fit_transform を使用
+    else:
+        y_scaled = scaler.transform(y_values.values.reshape(-1, 1)).flatten()
+
+    for col in X_features.columns:
+        mean = X_features[col].mean()
+        std = X_features[col].std()
+        if std > 0:
+            X_features[col] = (X_features[col] - mean) / (std + 1e-8)
+
+    return X_features.astype(np.float32), y_scaled.astype(np.float32), scaler
+
+def clean_data(train_data, test_data):
+    """
+    データの前処理を行う関数
+    """
+    print("[INFO] Starting data preprocessing...")
+
+    # Define target column
+    target_column = "value"
+
+    # One-Hot Encoding for categorical columns
     categorical_columns = ["type", "unit"]
     print(f"[INFO] One-Hot Encoding on columns: {categorical_columns}")
     train_data_encoded = pd.get_dummies(train_data, columns=categorical_columns)
     test_data_encoded = pd.get_dummies(test_data, columns=categorical_columns)
 
-    # 時系列処理：endDate をインデックスに設定
+    # Set datetime index
     train_data_ts = train_data_encoded.set_index("endDate")
     test_data_ts = test_data_encoded.set_index("endDate")
     train_data_ts = train_data_ts.set_index(pd.to_datetime(train_data_ts.index))
     test_data_ts = test_data_ts.set_index(pd.to_datetime(test_data_ts.index))
+    train_data_ts = train_data_ts.sort_index()
+    test_data_ts = test_data_ts.sort_index()
 
-    # target カラムの補完（数値変換、欠損値補完）
-    target_column = "value"
-    train_data_ts[target_column] = pd.to_numeric(train_data_ts[target_column], errors="coerce")
-    test_data_ts[target_column] = pd.to_numeric(test_data_ts[target_column], errors="coerce")
-    train_data_ts = train_data_ts.infer_objects().interpolate(method="linear")
-    test_data_ts = test_data_ts.infer_objects().interpolate(method="linear")
+    # Remove rows with missing values
+    train_data_ts = train_data_ts.dropna()
+    test_data_ts = test_data_ts.dropna()
 
-    # 特徴量は target カラム以外の全カラムを利用
-    feature_columns = [col for col in train_data_ts.columns if col != target_column]
-    sequence_length = 5
-    print(f"[INFO] Sequence generation with sequence_length = {sequence_length}")
-    print(f"[INFO] Number of feature columns: {len(feature_columns)}")
-
-    # バッチ生成用のジェネレータ作成（メモリ効率向上のため下流に連続配列として供給）
-    batch_size = 100000  # 必要に応じて調整
-    train_gen = create_sequences_generator(
-        train_data_ts[feature_columns].fillna(train_data_ts[feature_columns].mean()),
-        train_data_ts[target_column].fillna(train_data_ts[target_column].mean()),
-        sequence_length,
-        batch_size
+    # Process training data
+    print("[INFO] Processing training data...")
+    X_train, y_train, scaler = preprocess_features(train_data_ts, None, target_column)
+    train_data_ts = pd.concat(
+        [X_train, pd.Series(y_train, index=X_train.index, name=target_column)], axis=1
     )
 
-    total_sequences = len(train_data_ts) - sequence_length
-    steps_per_epoch = (total_sequences + batch_size - 1) // batch_size
-    print(f"[INFO] Steps per epoch: {steps_per_epoch}")
-
-    # LSTMモデルの定義（シンプルな構造の例）
-    model = tf.keras.models.Sequential([
-        tf.keras.layers.LSTM(
-            units=50,
-            activation="relu",
-            input_shape=(sequence_length, len(feature_columns))
-        ),
-        tf.keras.layers.Dense(units=1)
-    ])
-    model.compile(optimizer="adam", loss="mse")
-    model.summary()
-
-    epochs = 10
-    history = model.fit(
-        train_gen,
-        steps_per_epoch=steps_per_epoch,
-        epochs=epochs,
-        verbose=1
+    # Process test data
+    print("[INFO] Processing test data...")
+    X_test, y_test, _ = preprocess_features(test_data_ts, None, target_column)
+    test_data_ts = pd.concat(
+        [X_test, pd.Series(y_test, index=X_test.index, name=target_column)], axis=1
     )
 
-    print("[INFO] Model training complete.")
-    # ここで予測や評価も実施可能です。
+    # テストデータの前処理: 学習データ側の全カラムに合わせる
+    train_feature_columns = [
+        col for col in train_data_ts.columns if col != target_column
+    ]
 
+    # Save feature columns for later use in testing
+    wd = os.getcwd()
+    with open(os.path.join(wd, "model_tester", "train_feature_columns.json"), "w") as f:
+        json.dump(train_feature_columns, f)
+
+    # 学習データと同じ順序・カラム数に揃える（余分なカラムは削除し、不足分は0で埋める）
+    test_data_ts = test_data_ts.reindex(
+        columns=(train_feature_columns + [target_column]), fill_value=0
+    )
+
+    # テストデータの保存
+    test_data_ts.to_csv(
+        os.path.join(wd, "model_tester", "test_data_ts.csv"), index=True
+    )
+
+    print(
+        f"[INFO] Final shapes - Train: {train_data_ts.shape}, Test: {test_data_ts.shape}"
+    )
+    return train_data_ts, test_data_ts, scaler
