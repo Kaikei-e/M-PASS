@@ -2,7 +2,9 @@ from learning_machine.learn import learn
 
 
 def main(target_dir: str):
-    learn(target_dir)
+    model, history = learn(target_dir)
+    print(history)
+    model.save("model.h5")
 
 
 if __name__ == "__main__":
