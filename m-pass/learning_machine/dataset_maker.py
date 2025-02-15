@@ -26,7 +26,16 @@ class DatasetMaker:
         for event, elem in context:
             record = {}
             # HealthKit XMLで一般的な属性（必要に応じて追加・調整してください）
-            for key in ["type", "value", "unit", "sourceName", "device", "creationDate", "startDate", "endDate"]:
+            for key in [
+                "type",
+                "value",
+                "unit",
+                "sourceName",
+                "device",
+                "creationDate",
+                "startDate",
+                "endDate",
+            ]:
                 record[key] = elem.attrib.get(key)
             yield record
             elem.clear()  # メモリ解放
@@ -50,19 +59,23 @@ class DatasetMaker:
             for record in self.stream_xml_file(xml_file_path):
                 all_records.append(record)
                 count += 1
-            print(f"[INFO] Finished {xml_file_path}. Total records so far: {len(all_records)} (this file: {count})")
-        
+            print(
+                f"[INFO] Finished {xml_file_path}. Total records so far: {len(all_records)} (this file: {count})"
+            )
+
         df = pd.DataFrame(all_records)
         if df.empty:
-            raise ValueError("生成されたDataFrameが空です。XMLファイルの内容を再確認してください。")
-        
+            raise ValueError(
+                "生成されたDataFrameが空です。XMLファイルの内容を再確認してください。"
+            )
+
         # 前処理：endDate を日時型に変換し、時系列でソート
         df["endDate"] = pd.to_datetime(df["endDate"], errors="coerce")
         df.sort_values("endDate", inplace=True)
-        
+
         # 前処理：value カラムを数値に変換
         df["value"] = pd.to_numeric(df["value"], errors="coerce")
-        
+
         # 分割（例：80%を学習、残りをテスト）
         split_index = int(len(df) * 0.8)
         train_data = df.iloc[:split_index].copy()
@@ -146,6 +159,10 @@ class DatasetMaker:
                 "device",
             ],
         )
+
+        df["endDate"] = pd.to_datetime(df["endDate"], errors="coerce")
+        df.sort_values("endDate", inplace=True)
+
         return (
             df,
             invalid_value_count,
